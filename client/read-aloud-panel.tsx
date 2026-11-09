@@ -2,20 +2,22 @@ import type {
   PluginClientContext,
   PluginScreenProps,
 } from "@getpaseo/plugin/client";
+import { getPaseoClient, useHosts } from "@getpaseo/plugin/client";
 import { Icon, Loading, ScrollView, useToast } from "@getpaseo/plugin/client/ui";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { LayoutChangeEvent, ScrollView as NativeScrollView } from "react-native";
-import { Pressable, Text, View } from "react-native";
+import { ActivityIndicator, Pressable, Text, View } from "react-native";
 import { synthesizeSpeechRpc } from "../shared/speech";
 import {
   buildConversationSpeechUnits,
-  buildSpeechHighlightSteps,
   prepareTextForSpeech,
   splitIntoSpeechSegments,
   tokenizeSpeechText,
+  type ConversationSpeechUnit,
   type SpeechSegment,
 } from "../shared/text";
-import { playAudio, stopActiveAudio } from "./audio";
+import { prepareAudio, stopActiveAudio } from "./audio";
+import { runPrefetchedPlayback } from "./prefetched-playback";
 
 interface AssistantResponse {
   id: string;
@@ -35,6 +37,14 @@ type PlaybackState =
     };
 
 const RESPONSE_LIMIT = 30;
+const PREFETCH_LOOKAHEAD = 1;
+const CONNECTION_RETRY_MAX_DELAY_MS = 5_000;
+
+function isTransientConnectionError(message: string): boolean {
+  return /liveness check timed out|transport not connected|host is disconnected|connection (?:closed|lost)|daemon connection/i.test(
+    message,
+  );
+}
 
 const VOICE_OPTIONS = [
   { value: "female-shaonv", label: "清甜女声" },
@@ -52,7 +62,7 @@ const SPEED_OPTIONS = [
 ] as const;
 
 export function createReadAloudScreen(client: PluginClientContext) {
-  return function ReadAloudScreen({ params, theme, layout }: PluginScreenProps) {
+  return function ReadAloudScreen({ params, theme, host, layout }: PluginScreenProps) {
     const agentId = params.agentId;
     if (!agentId) {
       return (
@@ -71,6 +81,7 @@ export function createReadAloudScreen(client: PluginClientContext) {
       <ReadAloudPanelContent
         agentId={agentId}
         client={client}
+        hostId={host.id}
         theme={theme}
         layout={layout}
       />
@@ -81,22 +92,35 @@ export function createReadAloudScreen(client: PluginClientContext) {
 function ReadAloudPanelContent({
   agentId,
   client,
+  hostId,
   theme,
   layout,
 }: Pick<PluginScreenProps, "theme" | "layout"> & {
   agentId: string;
   client: PluginClientContext;
+  hostId: string;
 }) {
+  const hosts = useHosts();
+  const hostStatus = hosts.find((host) => host.serverId === hostId)?.status;
   const toast = useToast();
   const [responses, setResponses] = useState<AssistantResponse[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [playback, setPlayback] = useState<PlaybackState>({ status: "idle" });
+  const [loadingSegments, setLoadingSegments] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
   const [voice, setVoice] = useState<string>("female-shaonv");
   const [speed, setSpeed] = useState(1);
   const playbackToken = useRef(0);
+  const loadRequestToken = useRef(0);
+  const loadResponsesRef = useRef<() => Promise<void>>(async () => {});
+  const connectionRetryAttempt = useRef(0);
+  const connectionRetryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const highlightTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const loadingSegmentCounts = useRef(new Map<string, number>());
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const previousHost = useRef({ id: hostId, status: hostStatus });
   const scrollRef = useRef<NativeScrollView>(null);
   const responseOffsets = useRef(new Map<string, number>());
   const listOffsets = useRef(new Map<string, number>());
@@ -224,9 +248,50 @@ function ReadAloudPanelContent({
     highlightTimer.current = null;
   }, []);
 
+  const clearLoadingSegments = useCallback(() => {
+    loadingSegmentCounts.current.clear();
+    setLoadingSegments(new Set());
+  }, []);
+
+  const updateLoadingSegment = useCallback(
+    (token: number, unit: ConversationSpeechUnit, change: 1 | -1) => {
+      if (playbackToken.current !== token) return;
+      const keys = new Set(
+        unit.parts.map((part) => `${part.responseId}:${part.segmentIndex}`),
+      );
+      for (const key of keys) {
+        const nextCount = (loadingSegmentCounts.current.get(key) ?? 0) + change;
+        if (nextCount > 0) loadingSegmentCounts.current.set(key, nextCount);
+        else loadingSegmentCounts.current.delete(key);
+      }
+      setLoadingSegments(new Set(loadingSegmentCounts.current.keys()));
+    },
+    [],
+  );
+
+  const clearConnectionRetry = useCallback(() => {
+    if (connectionRetryTimer.current) clearTimeout(connectionRetryTimer.current);
+    connectionRetryTimer.current = null;
+    connectionRetryAttempt.current = 0;
+  }, []);
+
+  const scheduleConnectionRetry = useCallback(() => {
+    if (connectionRetryTimer.current) return;
+    const delay = Math.min(
+      500 * 2 ** connectionRetryAttempt.current,
+      CONNECTION_RETRY_MAX_DELAY_MS,
+    );
+    connectionRetryAttempt.current += 1;
+    connectionRetryTimer.current = setTimeout(() => {
+      connectionRetryTimer.current = null;
+      void loadResponsesRef.current();
+    }, delay);
+  }, []);
+
   const loadResponses = useCallback(async () => {
+    const requestToken = ++loadRequestToken.current;
     try {
-      const timeline = await client.paseo.agents.ref(agentId).timeline.refetch({
+      const timeline = await getPaseoClient(hostId).agents.ref(agentId).timeline.refetch({
         direction: "tail",
         limit: 240,
         projection: "projected",
@@ -249,19 +314,31 @@ function ReadAloudPanelContent({
           ];
         })
         .slice(-RESPONSE_LIMIT);
+      if (loadRequestToken.current !== requestToken) return;
+      clearConnectionRetry();
       setResponses(next);
       setError(null);
     } catch (nextError) {
-      setError(nextError instanceof Error ? nextError.message : String(nextError));
+      if (loadRequestToken.current !== requestToken) return;
+      const message = nextError instanceof Error ? nextError.message : String(nextError);
+      setError(message);
+      if (hostStatus === "online" && isTransientConnectionError(message)) {
+        scheduleConnectionRetry();
+      }
     } finally {
-      setLoading(false);
+      if (loadRequestToken.current === requestToken) setLoading(false);
     }
-  }, [agentId, client.paseo.agents]);
+  }, [agentId, clearConnectionRetry, hostId, hostStatus, scheduleConnectionRetry]);
+  loadResponsesRef.current = loadResponses;
 
   useEffect(() => {
     setLoading(true);
     void loadResponses();
-    const timeline = client.paseo.agents.ref(agentId).timeline;
+  }, [loadResponses]);
+
+  useEffect(() => {
+    if (hostStatus !== "online") return;
+    const timeline = getPaseoClient(hostId).agents.ref(agentId).timeline;
     const unsubscribe = timeline.subscribe(() => {
       if (refreshTimer.current) clearTimeout(refreshTimer.current);
       refreshTimer.current = setTimeout(() => void loadResponses(), 250);
@@ -269,11 +346,32 @@ function ReadAloudPanelContent({
     return () => {
       unsubscribe();
       if (refreshTimer.current) clearTimeout(refreshTimer.current);
-      clearHighlightTimer();
+      refreshTimer.current = null;
+    };
+  }, [agentId, hostId, hostStatus, loadResponses]);
+
+  useEffect(() => {
+    return () => {
+      loadRequestToken.current += 1;
       playbackToken.current += 1;
+      loadingSegmentCounts.current.clear();
+      clearConnectionRetry();
+      clearHighlightTimer();
       stopActiveAudio();
     };
-  }, [agentId, clearHighlightTimer, client.paseo.agents, loadResponses]);
+  }, [agentId, clearConnectionRetry, clearHighlightTimer]);
+
+  useEffect(() => {
+    const previous = previousHost.current;
+    previousHost.current = { id: hostId, status: hostStatus };
+    if (hostStatus !== "online") {
+      clearConnectionRetry();
+      return;
+    }
+    if (previous.id !== hostId || previous.status !== "online") {
+      void loadResponses();
+    }
+  }, [clearConnectionRetry, hostId, hostStatus, loadResponses]);
 
   const scrollToSegment = useCallback((responseId: string, segmentIndex: number) => {
     const responseY = responseOffsets.current.get(responseId);
@@ -288,6 +386,7 @@ function ReadAloudPanelContent({
 
   const stop = useCallback(() => {
     playbackToken.current += 1;
+    clearLoadingSegments();
     clearHighlightTimer();
     const stoppedImmediately = stopActiveAudio();
     setPlayback({ status: "idle" });
@@ -295,23 +394,32 @@ function ReadAloudPanelContent({
       stoppedImmediately ? "已停止朗读" : "已停止后续内容，当前音频分段结束后停止",
       { variant: "info" },
     );
-  }, [clearHighlightTimer, toast]);
+  }, [clearHighlightTimer, clearLoadingSegments, toast]);
 
-  const startWordHighlight = useCallback(
-    (
-      token: number,
-      location: {
-        responseId: string;
-        responseIndex: number;
-        segmentIndex: number;
-        text: string;
-      },
-      durationMs: number,
-    ) => {
+  const startChunkHighlight = useCallback(
+    (token: number, unit: ConversationSpeechUnit, durationMs: number) => {
       clearHighlightTimer();
-      const steps = buildSpeechHighlightSteps(location.text, durationMs);
+      const weightedTokens = unit.parts.flatMap((part) =>
+        tokenizeSpeechText(part.text).map((speechToken, tokenIndex) => ({
+          part,
+          speechToken,
+          tokenIndex,
+        })),
+      );
+      const totalWeight = weightedTokens.reduce(
+        (sum, item) => sum + item.speechToken.weight,
+        0,
+      );
+      let elapsedWeight = 0;
+      const steps = weightedTokens.flatMap((item) => {
+        const atMs =
+          totalWeight > 0 ? Math.round((elapsedWeight / totalWeight) * durationMs) : 0;
+        elapsedWeight += item.speechToken.weight;
+        return item.speechToken.isWord ? [{ ...item, atMs }] : [];
+      });
       const startedAt = Date.now();
       let stepIndex = 0;
+      let activeSegmentKey = "";
       const scheduleNext = () => {
         const step = steps[stepIndex];
         if (!step || playbackToken.current !== token) return;
@@ -320,91 +428,89 @@ function ReadAloudPanelContent({
           if (playbackToken.current !== token) return;
           setPlayback({
             status: "speaking",
-            responseId: location.responseId,
-            responseIndex: location.responseIndex,
-            segmentIndex: location.segmentIndex,
+            responseId: step.part.responseId,
+            responseIndex: step.part.responseIndex,
+            segmentIndex: step.part.segmentIndex,
             tokenIndex: step.tokenIndex,
           });
+          const segmentKey = `${step.part.responseId}:${step.part.segmentIndex}`;
+          if (segmentKey !== activeSegmentKey) {
+            activeSegmentKey = segmentKey;
+            scrollToSegment(step.part.responseId, step.part.segmentIndex);
+          }
           stepIndex += 1;
           scheduleNext();
         }, delay);
       };
       scheduleNext();
     },
-    [clearHighlightTimer],
+    [clearHighlightTimer, scrollToSegment],
   );
 
   const speakFrom = useCallback(
     async (responseIndex: number, segmentIndex: number) => {
       const token = ++playbackToken.current;
+      clearLoadingSegments();
       clearHighlightTimer();
       stopActiveAudio();
       const units = buildConversationSpeechUnits(responses, responseIndex, segmentIndex);
       if (units.length === 0) return;
 
-      const firstUnit = units[0];
-      setPlayback({
-        status: "preparing",
-        responseId: firstUnit.responseId,
-        responseIndex: firstUnit.responseIndex,
-        segmentIndex: firstUnit.segmentIndex,
-        tokenIndex: null,
-      });
-      scrollToSegment(firstUnit.responseId, firstUnit.segmentIndex);
-
-      const synthesize = async (text: string) => {
-        try {
-          return {
-            audio: await client.rpc(synthesizeSpeechRpc, {
-              text,
-              voice: voice || undefined,
-              speed,
-            }),
-          } as const;
-        } catch (rpcError) {
-          return { error: rpcError } as const;
-        }
-      };
-
       try {
-        let prepared = await synthesize(firstUnit.text);
-        for (let unitIndex = 0; unitIndex < units.length; unitIndex += 1) {
-          if (playbackToken.current !== token) return;
-          if ("error" in prepared) throw prepared.error;
-
-          const unit = units[unitIndex];
-          const nextUnit = units[unitIndex + 1];
-          const nextAudio = nextUnit ? synthesize(nextUnit.text) : null;
-          setPlayback({
-            status: "speaking",
-            responseId: unit.responseId,
-            responseIndex: unit.responseIndex,
-            segmentIndex: unit.segmentIndex,
-            tokenIndex: null,
-          });
-          scrollToSegment(unit.responseId, unit.segmentIndex);
-          startWordHighlight(token, unit, prepared.audio.durationMs);
-          await playAudio(client, prepared.audio);
-          clearHighlightTimer();
-          if (playbackToken.current !== token) return;
-
-          if (nextAudio && nextUnit) {
+        await runPrefetchedPlayback({
+          items: units,
+          lookahead: PREFETCH_LOOKAHEAD,
+          shouldContinue: () => playbackToken.current === token,
+          onPreparing: (unit) => {
             setPlayback({
               status: "preparing",
-              responseId: nextUnit.responseId,
-              responseIndex: nextUnit.responseIndex,
-              segmentIndex: nextUnit.segmentIndex,
+              responseId: unit.responseId,
+              responseIndex: unit.responseIndex,
+              segmentIndex: unit.segmentIndex,
               tokenIndex: null,
             });
-            prepared = await nextAudio;
-          }
-        }
+            scrollToSegment(unit.responseId, unit.segmentIndex);
+          },
+          async prepare(unit) {
+            updateLoadingSegment(token, unit, 1);
+            try {
+              const audio = await client.rpc(synthesizeSpeechRpc, {
+                text: unit.text,
+                voice: voice || undefined,
+                speed,
+              });
+              return { audio, playback: await prepareAudio(client, audio) };
+            } finally {
+              updateLoadingSegment(token, unit, -1);
+            }
+          },
+          onPlaying: (prepared, unit) => {
+            setPlayback({
+              status: "speaking",
+              responseId: unit.responseId,
+              responseIndex: unit.responseIndex,
+              segmentIndex: unit.segmentIndex,
+              tokenIndex: null,
+            });
+            scrollToSegment(unit.responseId, unit.segmentIndex);
+            startChunkHighlight(token, unit, prepared.audio.durationMs);
+          },
+          async play(prepared) {
+            await prepared.playback.play();
+            clearHighlightTimer();
+          },
+          dispose(prepared) {
+            prepared.playback.dispose();
+          },
+        });
         if (playbackToken.current === token) {
+          clearLoadingSegments();
           setPlayback({ status: "idle" });
           toast.show("已从上到下朗读完成", { variant: "success" });
         }
       } catch (nextError) {
         if (playbackToken.current !== token) return;
+        clearLoadingSegments();
         clearHighlightTimer();
         setPlayback({ status: "idle" });
         toast.error(nextError instanceof Error ? nextError.message : String(nextError));
@@ -412,12 +518,14 @@ function ReadAloudPanelContent({
     },
     [
       clearHighlightTimer,
+      clearLoadingSegments,
       client,
       responses,
       scrollToSegment,
       speed,
-      startWordHighlight,
+      startChunkHighlight,
       toast,
+      updateLoadingSegment,
       voice,
     ],
   );
@@ -433,7 +541,7 @@ function ReadAloudPanelContent({
           <View style={styles.titleGroup}>
             <Text style={styles.title}>连续朗读</Text>
             <Text style={styles.hint}>
-              按对话顺序从上往下连续朗读；自动清理 Markdown、链接、代码和装饰字符，点击任意句子可从那里继续。
+              首段快速生成，播放时自动准备下一大段；自动清理 Markdown、链接、代码和装饰字符，点击任意句子可从那里继续。
             </Text>
           </View>
           <View style={styles.headerActions}>
@@ -514,6 +622,9 @@ function ReadAloudPanelContent({
                   {response.segments.map((segment, segmentIndex) => {
                     const segmentActive = responseActive && playback.segmentIndex === segmentIndex;
                     const segmentSpeaking = segmentActive && playback.status === "speaking";
+                    const segmentLoading = loadingSegments.has(
+                      `${response.id}:${segmentIndex}`,
+                    );
                     const tokens = tokenizeSpeechText(segment.text);
                     return (
                       <Pressable
@@ -521,12 +632,14 @@ function ReadAloudPanelContent({
                         testID={`read-aloud-segment-${responseIndex}-${segmentIndex}`}
                         accessibilityRole="button"
                         accessibilityLabel={
-                          segmentActive
+                          segmentLoading
+                            ? `正在加载第 ${segmentIndex + 1} 句：${segment.text}`
+                            : segmentActive
                             ? `${segmentSpeaking ? "正在朗读" : "正在准备"}第 ${segmentIndex + 1} 句：${segment.text}`
                             : `从第 ${segmentIndex + 1} 句开始连续朗读`
                         }
                         accessibilityHint="将继续朗读这句话之后的全部回复"
-                        accessibilityState={{ selected: segmentActive }}
+                        accessibilityState={{ selected: segmentActive, busy: segmentLoading }}
                         onLayout={(event: LayoutChangeEvent) => {
                           segmentOffsets.current.set(
                             `${response.id}:${segmentIndex}`,
@@ -573,13 +686,19 @@ function ReadAloudPanelContent({
                             </Text>
                           ))}
                         </Text>
-                        <Icon
-                          name={segmentActive ? "AudioLines" : "Play"}
-                          size={16}
-                          color={
-                            segmentActive ? theme.colors.accent : theme.colors.foregroundMuted
-                          }
-                        />
+                        {segmentLoading ? (
+                          <ActivityIndicator size="small" color={theme.colors.accent} />
+                        ) : (
+                          <Icon
+                            name={segmentActive ? "AudioLines" : "Play"}
+                            size={16}
+                            color={
+                              segmentActive
+                                ? theme.colors.accent
+                                : theme.colors.foregroundMuted
+                            }
+                          />
+                        )}
                       </Pressable>
                     );
                   })}

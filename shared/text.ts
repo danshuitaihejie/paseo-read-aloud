@@ -8,9 +8,17 @@ export interface SpeechPlaybackUnit {
   segmentIndex: number;
 }
 
+export interface ConversationSpeechPart {
+  text: string;
+  responseId: string;
+  responseIndex: number;
+  segmentIndex: number;
+}
+
 export interface ConversationSpeechUnit extends SpeechPlaybackUnit {
   responseId: string;
   responseIndex: number;
+  parts: ConversationSpeechPart[];
 }
 
 export interface SpeechToken {
@@ -28,6 +36,8 @@ export interface SpeechHighlightStep {
 
 const MAX_SEGMENT_CHARACTERS = 220;
 export const MAX_SPEECH_CHUNK_CHARACTERS = 260;
+export const INITIAL_SPEECH_CHUNK_CHARACTERS = 220;
+export const CONTINUATION_SPEECH_CHUNK_CHARACTERS = 800;
 
 export function cleanTimelineText(text: string): string {
   return text.replace(/^(?:\s*---\s*)+/u, "").trim();
@@ -175,6 +185,8 @@ export function buildConversationSpeechUnits(
 ): ConversationSpeechUnit[] {
   const units: ConversationSpeechUnit[] = [];
   const firstResponseIndex = Math.max(0, startResponseIndex);
+  let firstUnit = true;
+
   for (
     let responseIndex = firstResponseIndex;
     responseIndex < responses.length;
@@ -182,9 +194,41 @@ export function buildConversationSpeechUnits(
   ) {
     const response = responses[responseIndex];
     const firstSegment = responseIndex === firstResponseIndex ? startSegmentIndex : 0;
-    for (const unit of buildSegmentSpeechUnits(response.segments, firstSegment)) {
-      units.push({ ...unit, responseId: response.id, responseIndex });
+    let parts: ConversationSpeechPart[] = [];
+    let textLength = 0;
+
+    const flush = () => {
+      if (parts.length === 0) return;
+      const firstPart = parts[0];
+      units.push({
+        text: parts.map((part) => part.text).join(" "),
+        responseId: firstPart.responseId,
+        responseIndex: firstPart.responseIndex,
+        segmentIndex: firstPart.segmentIndex,
+        parts,
+      });
+      parts = [];
+      textLength = 0;
+      firstUnit = false;
+    };
+
+    for (
+      let segmentIndex = Math.max(0, firstSegment);
+      segmentIndex < response.segments.length;
+      segmentIndex += 1
+    ) {
+      const text = response.segments[segmentIndex].text.trim();
+      if (!text) continue;
+      const limit = firstUnit
+        ? INITIAL_SPEECH_CHUNK_CHARACTERS
+        : CONTINUATION_SPEECH_CHUNK_CHARACTERS;
+      const nextLength = textLength + (parts.length > 0 ? 1 : 0) + text.length;
+      if (parts.length > 0 && nextLength > limit) flush();
+
+      parts.push({ text, responseId: response.id, responseIndex, segmentIndex });
+      textLength += (parts.length > 1 ? 1 : 0) + text.length;
     }
+    flush();
   }
   return units;
 }

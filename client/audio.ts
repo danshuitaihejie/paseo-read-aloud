@@ -1,72 +1,24 @@
 import type { PluginClientContext } from "@getpaseo/plugin/client";
-import { Platform } from "react-native";
+import { prepareWebAudio, stopActiveWebAudio } from "./web";
 
-interface AudioLike {
-  src: string;
-  currentTime: number;
-  onended: (() => void) | null;
-  onerror: (() => void) | null;
+export interface PreparedAudio {
   play(): Promise<void>;
-  pause(): void;
+  dispose(): void;
 }
-
-type AudioConstructor = new () => AudioLike;
-
-let activeWebAudio: AudioLike | null = null;
-let finishActiveWebAudio: (() => void) | null = null;
 
 export function stopActiveAudio() {
-  if (!activeWebAudio) return false;
-  const audio = activeWebAudio;
-  const finish = finishActiveWebAudio;
-  activeWebAudio = null;
-  finishActiveWebAudio = null;
-  audio.onended = null;
-  audio.onerror = null;
-  audio.pause();
-  audio.currentTime = 0;
-  finish?.();
-  return true;
+  return stopActiveWebAudio();
 }
 
-export async function playAudio(
+export async function prepareAudio(
   client: PluginClientContext,
   source: { base64: string; mimeType: string },
-) {
-  if (Platform.OS !== "web") {
-    await client.playAudio(source);
-    return;
-  }
-
-  const AudioApi = (globalThis as unknown as { Audio?: AudioConstructor }).Audio;
-  if (!AudioApi) {
-    await client.playAudio(source);
-    return;
-  }
-
-  stopActiveAudio();
-  const audio = new AudioApi();
-  activeWebAudio = audio;
-  audio.src = `data:${source.mimeType};base64,${source.base64}`;
-  await new Promise<void>((resolve, reject) => {
-    const finish = () => {
-      if (activeWebAudio === audio) activeWebAudio = null;
-      if (finishActiveWebAudio === finish) finishActiveWebAudio = null;
-      resolve();
-    };
-    finishActiveWebAudio = finish;
-    audio.onended = () => {
-      finish();
-    };
-    audio.onerror = () => {
-      if (activeWebAudio === audio) activeWebAudio = null;
-      if (finishActiveWebAudio === finish) finishActiveWebAudio = null;
-      reject(new Error("音频播放失败"));
-    };
-    audio.play().catch((error) => {
-      if (activeWebAudio === audio) activeWebAudio = null;
-      if (finishActiveWebAudio === finish) finishActiveWebAudio = null;
-      reject(error);
-    });
-  });
+): Promise<PreparedAudio> {
+  const webAudio = await prepareWebAudio(source);
+  return (
+    webAudio ?? {
+      play: () => client.playAudio(source),
+      dispose() {},
+    }
+  );
 }

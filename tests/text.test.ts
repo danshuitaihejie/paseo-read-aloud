@@ -43,9 +43,39 @@ describe("splitIntoSpeechSegments", () => {
       { id: "second", segments: splitIntoSpeechSegments("三。四。") },
     ];
     expect(buildConversationSpeechUnits(responses, 0, 1)).toEqual([
-      { text: "二。", segmentIndex: 1, responseId: "first", responseIndex: 0 },
-      { text: "三。", segmentIndex: 0, responseId: "second", responseIndex: 1 },
-      { text: "四。", segmentIndex: 1, responseId: "second", responseIndex: 1 },
+      {
+        text: "二。",
+        segmentIndex: 1,
+        responseId: "first",
+        responseIndex: 0,
+        parts: [
+          { text: "二。", segmentIndex: 1, responseId: "first", responseIndex: 0 },
+        ],
+      },
+      {
+        text: "三。 四。",
+        segmentIndex: 0,
+        responseId: "second",
+        responseIndex: 1,
+        parts: [
+          { text: "三。", segmentIndex: 0, responseId: "second", responseIndex: 1 },
+          { text: "四。", segmentIndex: 1, responseId: "second", responseIndex: 1 },
+        ],
+      },
+    ]);
+  });
+
+  it("keeps the first chunk short and groups later sentences into larger chunks", () => {
+    const segments = Array.from({ length: 10 }, (_, index) => ({
+      id: `sentence-${index}`,
+      text: String(index).repeat(100),
+    }));
+    const units = buildConversationSpeechUnits([{ id: "response", segments }], 0, 0);
+
+    expect(units.map((unit) => unit.text.length)).toEqual([201, 706, 100]);
+    expect(units.map((unit) => unit.parts.length)).toEqual([2, 7, 1]);
+    expect(units.flatMap((unit) => unit.parts).map((part) => part.segmentIndex)).toEqual([
+      0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
     ]);
   });
 
