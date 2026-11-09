@@ -1,0 +1,14 @@
+{
+  "id": "paseo-read-aloud",
+  "name": "专属朗读",
+  "description": "在当前正式版 Paseo 中浏览助手回复，并从任意句子开始朗读。",
+  "translations": {
+    "zh-CN": {
+      "name": "专属朗读",
+      "description": "在当前正式版 Paseo 中浏览助手回复，并从任意句子开始朗读。"
+    }
+  },
+  "requirements": {
+    "paseo": ">=0.15.3"
+  }
+}

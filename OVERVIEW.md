@@ -1,0 +1,9 @@
+# Read aloud
+
+Read aloud adds a dedicated full-screen reading page to every Paseo agent. Recent assistant responses appear in chronological order. One press reads continuously from top to bottom, while any sentence remains available as a new starting point. During playback, the current word is highlighted on an approximate timeline and the page follows the active sentence.
+
+Before synthesis, the plugin removes Markdown decoration, raw links, code blocks, generic attachments, and symbol-only paragraphs while preserving readable headings, lists, tables, and link labels. Speech generation reuses the OpenAI-compatible TTS configuration already saved under Paseo's Voice settings. The selected text is sent to that configured endpoint and the resulting audio is played on the current Paseo client. The plugin does not store another API key. Its reading page also provides female voice presets for the configured MiniMax adapter and four playback speeds.
+
+Paseo 0.15.3 or later is required. Configure an OpenAI-compatible TTS provider under Settings → Voice before using the plugin. The current public plugin API does not expose Paseo's local speech provider directly.
+
+Word timing is estimated from the real audio duration and spoken-text weights, so it is a reading aid rather than forced alignment. On web and desktop clients, Stop interrupts the active audio immediately. On iOS and Android, Stop prevents later chunks from playing after the current short chunk finishes. Until Paseo exposes response-footer actions to plugins, the controls live on a separate full-screen page rather than inside the native message footer.
