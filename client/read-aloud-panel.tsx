@@ -17,6 +17,7 @@ import {
   type SpeechSegment,
 } from "../shared/text";
 import { prepareAudio, stopActiveAudio } from "./audio";
+import { isTransientConnectionError } from "./connection-errors";
 import { runPrefetchedPlayback } from "./prefetched-playback";
 
 interface AssistantResponse {
@@ -36,15 +37,15 @@ type PlaybackState =
       tokenIndex: number | null;
     };
 
+interface PlaybackError {
+  message: string;
+  responseIndex: number;
+  segmentIndex: number;
+}
+
 const RESPONSE_LIMIT = 30;
 const PREFETCH_LOOKAHEAD = 1;
 const CONNECTION_RETRY_MAX_DELAY_MS = 5_000;
-
-function isTransientConnectionError(message: string): boolean {
-  return /liveness check timed out|transport not connected|host is disconnected|connection (?:closed|lost)|daemon connection/i.test(
-    message,
-  );
-}
 
 const VOICE_OPTIONS = [
   { value: "female-shaonv", label: "清甜女声" },
@@ -105,8 +106,10 @@ function ReadAloudPanelContent({
   const toast = useToast();
   const [responses, setResponses] = useState<AssistantResponse[]>([]);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [playback, setPlayback] = useState<PlaybackState>({ status: "idle" });
+  const [playbackError, setPlaybackError] = useState<PlaybackError | null>(null);
   const [loadingSegments, setLoadingSegments] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
@@ -121,6 +124,7 @@ function ReadAloudPanelContent({
   const loadingSegmentCounts = useRef(new Map<string, number>());
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const previousHost = useRef({ id: hostId, status: hostStatus });
+  const hostStatusRef = useRef(hostStatus);
   const scrollRef = useRef<NativeScrollView>(null);
   const responseOffsets = useRef(new Map<string, number>());
   const listOffsets = useRef(new Map<string, number>());
@@ -186,11 +190,21 @@ function ReadAloudPanelContent({
       },
       chipText: { color: theme.colors.foreground, fontSize: 12 },
       chipTextActive: { color: theme.colors.accentForeground, fontWeight: "600" as const },
-      error: {
-        color: theme.colors.statusDanger,
+      errorPanel: {
+        flexDirection: layout.compact ? ("column" as const) : ("row" as const),
+        alignItems: layout.compact ? ("stretch" as const) : ("center" as const),
+        gap: 10,
         padding: 12,
+        borderWidth: 1,
+        borderColor: theme.colors.statusDanger,
         borderRadius: 8,
         backgroundColor: theme.colors.surface1,
+      },
+      errorText: {
+        flex: 1,
+        color: theme.colors.statusDanger,
+        fontSize: 13,
+        lineHeight: 19,
       },
       empty: {
         color: theme.colors.foregroundMuted,
@@ -242,6 +256,7 @@ function ReadAloudPanelContent({
     }),
     [layout.compact, theme],
   );
+  hostStatusRef.current = hostStatus;
 
   const clearHighlightTimer = useCallback(() => {
     if (highlightTimer.current) clearTimeout(highlightTimer.current);
@@ -290,6 +305,7 @@ function ReadAloudPanelContent({
 
   const loadResponses = useCallback(async () => {
     const requestToken = ++loadRequestToken.current;
+    setRefreshing(true);
     try {
       const timeline = await getPaseoClient(hostId).agents.ref(agentId).timeline.refetch({
         direction: "tail",
@@ -322,19 +338,22 @@ function ReadAloudPanelContent({
       if (loadRequestToken.current !== requestToken) return;
       const message = nextError instanceof Error ? nextError.message : String(nextError);
       setError(message);
-      if (hostStatus === "online" && isTransientConnectionError(message)) {
+      if (hostStatusRef.current === "online" && isTransientConnectionError(message)) {
         scheduleConnectionRetry();
       }
     } finally {
-      if (loadRequestToken.current === requestToken) setLoading(false);
+      if (loadRequestToken.current === requestToken) {
+        setLoading(false);
+        setRefreshing(false);
+      }
     }
-  }, [agentId, clearConnectionRetry, hostId, hostStatus, scheduleConnectionRetry]);
+  }, [agentId, clearConnectionRetry, hostId, scheduleConnectionRetry]);
   loadResponsesRef.current = loadResponses;
 
   useEffect(() => {
     setLoading(true);
-    void loadResponses();
-  }, [loadResponses]);
+    void loadResponsesRef.current();
+  }, [agentId, hostId]);
 
   useEffect(() => {
     if (hostStatus !== "online") return;
@@ -368,10 +387,15 @@ function ReadAloudPanelContent({
       clearConnectionRetry();
       return;
     }
-    if (previous.id !== hostId || previous.status !== "online") {
+    if (previous.id === hostId && previous.status !== "online") {
       void loadResponses();
     }
   }, [clearConnectionRetry, hostId, hostStatus, loadResponses]);
+
+  const retryLoadResponses = useCallback(() => {
+    clearConnectionRetry();
+    void loadResponses();
+  }, [clearConnectionRetry, loadResponses]);
 
   const scrollToSegment = useCallback((responseId: string, segmentIndex: number) => {
     const responseY = responseOffsets.current.get(responseId);
@@ -450,11 +474,13 @@ function ReadAloudPanelContent({
   const speakFrom = useCallback(
     async (responseIndex: number, segmentIndex: number) => {
       const token = ++playbackToken.current;
+      setPlaybackError(null);
       clearLoadingSegments();
       clearHighlightTimer();
       stopActiveAudio();
       const units = buildConversationSpeechUnits(responses, responseIndex, segmentIndex);
       if (units.length === 0) return;
+      let failedUnit: ConversationSpeechUnit | null = null;
 
       try {
         await runPrefetchedPlayback({
@@ -480,6 +506,9 @@ function ReadAloudPanelContent({
                 speed,
               });
               return { audio, playback: await prepareAudio(client, audio) };
+            } catch (nextError) {
+              failedUnit = unit;
+              throw nextError;
             } finally {
               updateLoadingSegment(token, unit, -1);
             }
@@ -513,7 +542,14 @@ function ReadAloudPanelContent({
         clearLoadingSegments();
         clearHighlightTimer();
         setPlayback({ status: "idle" });
-        toast.error(nextError instanceof Error ? nextError.message : String(nextError));
+        const message = nextError instanceof Error ? nextError.message : String(nextError);
+        const retryUnit = failedUnit ?? units[0];
+        setPlaybackError({
+          message,
+          responseIndex: retryUnit.responseIndex,
+          segmentIndex: retryUnit.segmentIndex,
+        });
+        toast.error(message);
       }
     },
     [
@@ -546,10 +582,10 @@ function ReadAloudPanelContent({
           </View>
           <View style={styles.headerActions}>
             <ActionButton
-              label="刷新"
+              label={refreshing ? "刷新中" : "刷新"}
               icon="RefreshCw"
-              disabled={isActive}
-              onPress={() => void loadResponses()}
+              disabled={isActive || refreshing}
+              onPress={retryLoadResponses}
               styles={styles}
               theme={theme}
             />
@@ -595,7 +631,44 @@ function ReadAloudPanelContent({
           />
         </View>
 
-        {error ? <Text style={styles.error}>{error}</Text> : null}
+        {error ? (
+          <View style={styles.errorPanel} accessibilityRole="alert">
+            <Text selectable style={styles.errorText}>
+              {error}
+              {isTransientConnectionError(error)
+                ? "\n连接恢复后会自动重试，也可以立即手动重试。"
+                : "\n请检查后手动重试。"}
+            </Text>
+            <ActionButton
+              label={refreshing ? "重试中" : "重试"}
+              icon="RefreshCw"
+              disabled={refreshing}
+              onPress={retryLoadResponses}
+              styles={styles}
+              theme={theme}
+            />
+          </View>
+        ) : null}
+        {playbackError ? (
+          <View style={styles.errorPanel} accessibilityRole="alert">
+            <Text selectable style={styles.errorText}>
+              朗读失败：{playbackError.message}
+              {isTransientConnectionError(playbackError.message)
+                ? "\n当前页面和阅读位置已保留，请从失败位置重试。"
+                : "\n请从失败位置重试。"}
+            </Text>
+            <ActionButton
+              label="重试朗读"
+              icon="Play"
+              disabled={isActive}
+              onPress={() =>
+                void speakFrom(playbackError.responseIndex, playbackError.segmentIndex)
+              }
+              styles={styles}
+              theme={theme}
+            />
+          </View>
+        ) : null}
         {responses.length === 0 ? (
           <Text style={styles.empty}>当前会话还没有可朗读的助手回复。</Text>
         ) : (
