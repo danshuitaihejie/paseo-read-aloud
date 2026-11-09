@@ -45,6 +45,11 @@ export async function runPrefetchedPlayback<Item, Prepared>({
   const preparations = new Map<number, Preparation<Prepared>>();
   const used = new Set<number>();
   const bufferSize = Math.max(1, Math.floor(lookahead));
+  let prefetchTarget = 0;
+  let nextPrefetchIndex = 1;
+  let prefetchPump: Promise<void> | null = null;
+  let prefetchFailed = false;
+  let active = true;
 
   const ensurePrepared = (index: number) => {
     const existing = preparations.get(index);
@@ -80,11 +85,43 @@ export async function runPrefetchedPlayback<Item, Prepared>({
     return result.value;
   };
 
-  const prefetchAfter = (index: number) => {
-    const end = Math.min(items.length - 1, index + bufferSize);
-    for (let nextIndex = index + 1; nextIndex <= end; nextIndex += 1) {
-      ensurePrepared(nextIndex);
+  const runPrefetchPump = () => {
+    if (
+      prefetchPump ||
+      prefetchFailed ||
+      !active ||
+      nextPrefetchIndex > prefetchTarget ||
+      !shouldContinue()
+    ) {
+      return;
     }
+    prefetchPump = (async () => {
+      while (
+        nextPrefetchIndex <= prefetchTarget &&
+        nextPrefetchIndex < items.length &&
+        active &&
+        shouldContinue()
+      ) {
+        const index = nextPrefetchIndex;
+        nextPrefetchIndex += 1;
+        const result = await ensurePrepared(index).promise;
+        if (result.status === "rejected") {
+          prefetchFailed = true;
+          return;
+        }
+        if (nextPrefetchIndex <= prefetchTarget && shouldContinue()) {
+          await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        }
+      }
+    })().finally(() => {
+      prefetchPump = null;
+      runPrefetchPump();
+    });
+  };
+
+  const prefetchAfter = (index: number) => {
+    prefetchTarget = Math.max(prefetchTarget, Math.min(items.length - 1, index + bufferSize));
+    runPrefetchPump();
   };
 
   try {
@@ -94,7 +131,7 @@ export async function runPrefetchedPlayback<Item, Prepared>({
     for (let index = 0; index < items.length; index += 1) {
       if (!shouldContinue()) return;
 
-      // Start every future preparation before current playback begins.
+      // Keep the rolling future buffer full while the current item plays.
       prefetchAfter(index);
       used.add(index);
       onPlaying?.(prepared, items[index], index);
@@ -108,6 +145,7 @@ export async function runPrefetchedPlayback<Item, Prepared>({
       prepared = await readPrepared(nextIndex);
     }
   } finally {
+    active = false;
     if (dispose) {
       for (const [index, preparation] of preparations) {
         if (used.has(index)) continue;

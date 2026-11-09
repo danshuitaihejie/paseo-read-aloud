@@ -13,6 +13,8 @@ export interface ConversationSpeechPart {
   responseId: string;
   responseIndex: number;
   segmentIndex: number;
+  characterOffset?: number;
+  tokenOffset?: number;
 }
 
 export interface ConversationSpeechUnit extends SpeechPlaybackUnit {
@@ -35,9 +37,9 @@ export interface SpeechHighlightStep {
 }
 
 const MAX_SEGMENT_CHARACTERS = 220;
-export const MAX_SPEECH_CHUNK_CHARACTERS = 260;
-export const INITIAL_SPEECH_CHUNK_CHARACTERS = 220;
-export const CONTINUATION_SPEECH_CHUNK_CHARACTERS = 800;
+export const MAX_SPEECH_CHUNK_CHARACTERS = 80;
+export const INITIAL_SPEECH_CHUNK_CHARACTERS = 80;
+export const CONTINUATION_SPEECH_CHUNK_CHARACTERS = 80;
 
 export function cleanTimelineText(text: string): string {
   return text.replace(/^(?:\s*---\s*)+/u, "").trim();
@@ -99,13 +101,19 @@ export function prepareTextForSpeech(text: string): string {
       .trim();
 
     if (!hasMeaningfulText(line)) continue;
-    if ((isHeading || isListItem || originalLine.includes("|")) && !/[。！？；.!?;：:]$/u.test(line)) {
+    if (
+      (isHeading || isListItem || originalLine.includes("|")) &&
+      !/[。！？；.!?;：:]$/u.test(line)
+    ) {
       line += "。";
     }
     spokenLines.push(line);
   }
 
-  return spokenLines.join("\n").replace(/\n{2,}/g, "\n").trim();
+  return spokenLines
+    .join("\n")
+    .replace(/\n{2,}/g, "\n")
+    .trim();
 }
 
 export function splitIntoSpeechSegments(text: string): SpeechSegment[] {
@@ -182,10 +190,28 @@ export function buildConversationSpeechUnits(
   responses: readonly { id: string; segments: readonly SpeechSegment[] }[],
   startResponseIndex: number,
   startSegmentIndex: number,
+  startCharacterOffset = 0,
 ): ConversationSpeechUnit[] {
   const units: ConversationSpeechUnit[] = [];
   const firstResponseIndex = Math.max(0, startResponseIndex);
+  let parts: ConversationSpeechPart[] = [];
+  let textLength = 0;
   let firstUnit = true;
+
+  const flush = () => {
+    if (parts.length === 0) return;
+    const firstPart = parts[0];
+    units.push({
+      text: parts.map((part) => part.text).join(" "),
+      responseId: firstPart.responseId,
+      responseIndex: firstPart.responseIndex,
+      segmentIndex: firstPart.segmentIndex,
+      parts,
+    });
+    parts = [];
+    textLength = 0;
+    firstUnit = false;
+  };
 
   for (
     let responseIndex = firstResponseIndex;
@@ -194,42 +220,50 @@ export function buildConversationSpeechUnits(
   ) {
     const response = responses[responseIndex];
     const firstSegment = responseIndex === firstResponseIndex ? startSegmentIndex : 0;
-    let parts: ConversationSpeechPart[] = [];
-    let textLength = 0;
-
-    const flush = () => {
-      if (parts.length === 0) return;
-      const firstPart = parts[0];
-      units.push({
-        text: parts.map((part) => part.text).join(" "),
-        responseId: firstPart.responseId,
-        responseIndex: firstPart.responseIndex,
-        segmentIndex: firstPart.segmentIndex,
-        parts,
-      });
-      parts = [];
-      textLength = 0;
-      firstUnit = false;
-    };
 
     for (
       let segmentIndex = Math.max(0, firstSegment);
       segmentIndex < response.segments.length;
       segmentIndex += 1
     ) {
-      const text = response.segments[segmentIndex].text.trim();
+      const sourceText = response.segments[segmentIndex].text.trim();
+      const requestedOffset =
+        responseIndex === firstResponseIndex && segmentIndex === Math.max(0, firstSegment)
+          ? Math.max(0, Math.min(sourceText.length, startCharacterOffset))
+          : 0;
+      const remainingText = sourceText.slice(requestedOffset);
+      const leadingWhitespace = remainingText.length - remainingText.trimStart().length;
+      const baseOffset = requestedOffset + leadingWhitespace;
+      const text = remainingText.trim();
       if (!text) continue;
-      const limit = firstUnit
-        ? INITIAL_SPEECH_CHUNK_CHARACTERS
-        : CONTINUATION_SPEECH_CHUNK_CHARACTERS;
-      const nextLength = textLength + (parts.length > 0 ? 1 : 0) + text.length;
-      if (parts.length > 0 && nextLength > limit) flush();
+      const speechParts = splitLongText(text, MAX_SPEECH_CHUNK_CHARACTERS);
+      let searchStart = 0;
+      for (const speechPart of speechParts) {
+        const localStart = Math.max(0, text.indexOf(speechPart, searchStart));
+        const sourceStart = baseOffset + localStart;
+        const tokenOffset =
+          sourceStart > 0 ? tokenizeSpeechText(sourceText.slice(0, sourceStart)).length : 0;
+        searchStart = localStart + speechPart.length;
 
-      parts.push({ text, responseId: response.id, responseIndex, segmentIndex });
-      textLength += (parts.length > 1 ? 1 : 0) + text.length;
+        const limit = firstUnit
+          ? INITIAL_SPEECH_CHUNK_CHARACTERS
+          : CONTINUATION_SPEECH_CHUNK_CHARACTERS;
+        const nextLength = textLength + (parts.length > 0 ? 1 : 0) + speechPart.length;
+        if (parts.length > 0 && nextLength > limit) flush();
+
+        parts.push({
+          text: speechPart,
+          responseId: response.id,
+          responseIndex,
+          segmentIndex,
+          ...(sourceStart > 0 ? { characterOffset: sourceStart } : {}),
+          ...(tokenOffset > 0 ? { tokenOffset } : {}),
+        });
+        textLength += (parts.length > 1 ? 1 : 0) + speechPart.length;
+      }
     }
-    flush();
   }
+  flush();
   return units;
 }
 

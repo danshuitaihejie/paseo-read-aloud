@@ -37,27 +37,19 @@ describe("splitIntoSpeechSegments", () => {
     ]);
   });
 
-  it("continues from the selected sentence through every later response", () => {
+  it("packs short sentences across response boundaries", () => {
     const responses = [
       { id: "first", segments: splitIntoSpeechSegments("一。二。") },
       { id: "second", segments: splitIntoSpeechSegments("三。四。") },
     ];
     expect(buildConversationSpeechUnits(responses, 0, 1)).toEqual([
       {
-        text: "二。",
+        text: "二。 三。 四。",
         segmentIndex: 1,
         responseId: "first",
         responseIndex: 0,
         parts: [
           { text: "二。", segmentIndex: 1, responseId: "first", responseIndex: 0 },
-        ],
-      },
-      {
-        text: "三。 四。",
-        segmentIndex: 0,
-        responseId: "second",
-        responseIndex: 1,
-        parts: [
           { text: "三。", segmentIndex: 0, responseId: "second", responseIndex: 1 },
           { text: "四。", segmentIndex: 1, responseId: "second", responseIndex: 1 },
         ],
@@ -65,28 +57,66 @@ describe("splitIntoSpeechSegments", () => {
     ]);
   });
 
-  it("keeps the first chunk short and groups later sentences into larger chunks", () => {
+  it("packs only cleaned speakable text into the request", () => {
+    const responses = [
+      {
+        id: "first",
+        segments: splitIntoSpeechSegments(
+          prepareTextForSpeech("## 标题\n```ts\nconst ignored = true;\n```"),
+        ),
+      },
+      {
+        id: "second",
+        segments: splitIntoSpeechSegments(prepareTextForSpeech("✨✨\n第二句。")),
+      },
+    ];
+
+    expect(buildConversationSpeechUnits(responses, 0, 0).map((unit) => unit.text)).toEqual([
+      "标题。 第二句。",
+    ]);
+  });
+
+  it("keeps every relay audio chunk within 80 characters", () => {
     const segments = Array.from({ length: 10 }, (_, index) => ({
       id: `sentence-${index}`,
-      text: String(index).repeat(100),
+      text: String(index).repeat(80),
     }));
     const units = buildConversationSpeechUnits([{ id: "response", segments }], 0, 0);
 
-    expect(units.map((unit) => unit.text.length)).toEqual([201, 706, 100]);
-    expect(units.map((unit) => unit.parts.length)).toEqual([2, 7, 1]);
+    expect(units.map((unit) => unit.text.length)).toEqual(Array(10).fill(80));
+    expect(units.map((unit) => unit.parts.length)).toEqual(Array(10).fill(1));
     expect(units.flatMap((unit) => unit.parts).map((part) => part.segmentIndex)).toEqual([
       0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
     ]);
   });
 
+  it("keeps a long sentence visible as one segment while splitting only its audio", () => {
+    const segments = splitIntoSpeechSegments("连续内容".repeat(40));
+    const units = buildConversationSpeechUnits([{ id: "response", segments }], 0, 0);
+
+    expect(segments).toHaveLength(1);
+    expect(units).toHaveLength(2);
+    expect(units.every((unit) => unit.text.length <= 80)).toBe(true);
+    expect(units.flatMap((unit) => unit.parts).every((part) => part.segmentIndex === 0)).toBe(true);
+    expect(units[1].parts[0].characterOffset).toBe(units[0].text.length);
+    expect(units[1].parts[0].tokenOffset).toBeGreaterThan(0);
+  });
+
+  it("starts a long sentence from an exact character offset", () => {
+    const responses = [
+      { id: "response", segments: splitIntoSpeechSegments("连续内容".repeat(40)) },
+    ];
+    const units = buildConversationSpeechUnits(responses, 0, 0);
+    const resumed = buildConversationSpeechUnits(responses, 0, 0, units[0].text.length);
+
+    expect(resumed.map((unit) => unit.text)).toEqual(units.slice(1).map((unit) => unit.text));
+    expect(resumed[0].parts[0].characterOffset).toBe(units[0].text.length);
+  });
+
   it("keeps decimal numbers together and drops Paseo commentary separators", () => {
-    expect(cleanTimelineText("--- 语音耗时 4.6 秒。下一句。")).toBe(
-      "语音耗时 4.6 秒。下一句。",
-    );
+    expect(cleanTimelineText("--- 语音耗时 4.6 秒。下一句。")).toBe("语音耗时 4.6 秒。下一句。");
     expect(
-      splitIntoSpeechSegments("--- 语音耗时 4.6 秒。下一句。").map(
-        ({ text }) => text,
-      ),
+      splitIntoSpeechSegments("--- 语音耗时 4.6 秒。下一句。").map(({ text }) => text),
     ).toEqual(["语音耗时 4.6 秒。", "下一句。"]);
   });
 });
@@ -108,9 +138,7 @@ describe("normalizeTextForSpeech", () => {
   });
 
   it("keeps identifier words separated instead of gluing them together", () => {
-    expect(prepareTextForSpeech("安装 `node_modules` 后继续。")).toBe(
-      "安装 node modules 后继续。",
-    );
+    expect(prepareTextForSpeech("安装 `node_modules` 后继续。")).toBe("安装 node modules 后继续。");
   });
 });
 

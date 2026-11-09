@@ -1,12 +1,16 @@
-import type {
-  PluginClientContext,
-  PluginScreenProps,
-} from "@getpaseo/plugin/client";
+import type { PluginClientContext, PluginScreenProps } from "@getpaseo/plugin/client";
 import { getPaseoClient, useHosts } from "@getpaseo/plugin/client";
 import { Icon, Loading, ScrollView, useToast } from "@getpaseo/plugin/client/ui";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { LayoutChangeEvent, ScrollView as NativeScrollView } from "react-native";
 import { ActivityIndicator, Pressable, Text, View } from "react-native";
+import {
+  cursorAfterSpeechUnit,
+  cursorAtSpeechStart,
+  resolveSpeechStart,
+  type ReadProgressCursor,
+  type SpeechStart,
+} from "../shared/read-progress";
 import { synthesizeSpeechRpc } from "../shared/speech";
 import {
   buildConversationSpeechUnits,
@@ -19,6 +23,8 @@ import {
 import { prepareAudio, stopActiveAudio } from "./audio";
 import { isTransientConnectionError } from "./connection-errors";
 import { runPrefetchedPlayback } from "./prefetched-playback";
+import { loadReadProgress, saveReadProgress } from "./read-progress-store";
+import { speechAudioCache, speechAudioCacheKey } from "./speech-cache";
 
 interface AssistantResponse {
   id: string;
@@ -41,10 +47,19 @@ interface PlaybackError {
   message: string;
   responseIndex: number;
   segmentIndex: number;
+  characterOffset: number;
+}
+
+type ProgressStatus = "loading" | "ready" | "error";
+
+interface PendingProgressSave {
+  hostId: string;
+  agentId: string;
+  cursor: ReadProgressCursor;
 }
 
 const RESPONSE_LIMIT = 30;
-const PREFETCH_LOOKAHEAD = 1;
+const PREFETCH_LOOKAHEAD = 5;
 const CONNECTION_RETRY_MAX_DELAY_MS = 5_000;
 
 const VOICE_OPTIONS = [
@@ -110,9 +125,10 @@ function ReadAloudPanelContent({
   const [error, setError] = useState<string | null>(null);
   const [playback, setPlayback] = useState<PlaybackState>({ status: "idle" });
   const [playbackError, setPlaybackError] = useState<PlaybackError | null>(null);
-  const [loadingSegments, setLoadingSegments] = useState<ReadonlySet<string>>(
-    () => new Set(),
-  );
+  const [loadingSegments, setLoadingSegments] = useState<ReadonlySet<string>>(() => new Set());
+  const [savedProgress, setSavedProgress] = useState<ReadProgressCursor | null>(null);
+  const [progressStatus, setProgressStatus] = useState<ProgressStatus>("loading");
+  const [progressError, setProgressError] = useState<string | null>(null);
   const [voice, setVoice] = useState<string>("female-shaonv");
   const [speed, setSpeed] = useState(1);
   const playbackToken = useRef(0);
@@ -129,16 +145,26 @@ function ReadAloudPanelContent({
   const responseOffsets = useRef(new Map<string, number>());
   const listOffsets = useRef(new Map<string, number>());
   const segmentOffsets = useRef(new Map<string, number>());
+  const progressRequestToken = useRef(0);
+  const pendingProgressSaves = useRef(new Map<string, PendingProgressSave>());
+  const progressSaveRunning = useRef(false);
+  const progressContext = useRef({ hostId, agentId });
 
   const styles = useMemo(
     () => ({
       root: { flex: 1, backgroundColor: theme.colors.surface0 },
+      scroll: { flex: 1 },
       content: { padding: layout.compact ? 12 : 20, gap: 12 },
       header: {
         flexDirection: layout.compact ? ("column" as const) : ("row" as const),
         alignItems: layout.compact ? ("stretch" as const) : ("center" as const),
         justifyContent: "space-between" as const,
         gap: 12,
+        paddingHorizontal: layout.compact ? 12 : 20,
+        paddingVertical: 12,
+        borderBottomWidth: 1,
+        borderBottomColor: theme.colors.border,
+        backgroundColor: theme.colors.surface0,
       },
       titleGroup: { flex: 1, gap: 4 },
       title: { color: theme.colors.foreground, fontSize: 20, fontWeight: "600" as const },
@@ -257,6 +283,7 @@ function ReadAloudPanelContent({
     [layout.compact, theme],
   );
   hostStatusRef.current = hostStatus;
+  progressContext.current = { hostId, agentId };
 
   const clearHighlightTimer = useCallback(() => {
     if (highlightTimer.current) clearTimeout(highlightTimer.current);
@@ -271,9 +298,7 @@ function ReadAloudPanelContent({
   const updateLoadingSegment = useCallback(
     (token: number, unit: ConversationSpeechUnit, change: 1 | -1) => {
       if (playbackToken.current !== token) return;
-      const keys = new Set(
-        unit.parts.map((part) => `${part.responseId}:${part.segmentIndex}`),
-      );
+      const keys = new Set(unit.parts.map((part) => `${part.responseId}:${part.segmentIndex}`));
       for (const key of keys) {
         const nextCount = (loadingSegmentCounts.current.get(key) ?? 0) + change;
         if (nextCount > 0) loadingSegmentCounts.current.set(key, nextCount);
@@ -376,9 +401,9 @@ function ReadAloudPanelContent({
       loadingSegmentCounts.current.clear();
       clearConnectionRetry();
       clearHighlightTimer();
-      stopActiveAudio();
+      stopActiveAudio(client);
     };
-  }, [agentId, clearConnectionRetry, clearHighlightTimer]);
+  }, [agentId, clearConnectionRetry, clearHighlightTimer, client]);
 
   useEffect(() => {
     const previous = previousHost.current;
@@ -397,13 +422,81 @@ function ReadAloudPanelContent({
     void loadResponses();
   }, [clearConnectionRetry, loadResponses]);
 
+  const loadProgress = useCallback(async () => {
+    const requestToken = ++progressRequestToken.current;
+    setSavedProgress(null);
+    setProgressStatus("loading");
+    setProgressError(null);
+    try {
+      const cursor = await loadReadProgress(client, agentId);
+      if (progressRequestToken.current !== requestToken) return;
+      setSavedProgress(cursor);
+      setProgressStatus("ready");
+    } catch (nextError) {
+      if (progressRequestToken.current !== requestToken) return;
+      setProgressStatus("error");
+      setProgressError(nextError instanceof Error ? nextError.message : String(nextError));
+    }
+  }, [agentId, client]);
+
+  useEffect(() => {
+    void loadProgress();
+    return () => {
+      progressRequestToken.current += 1;
+    };
+  }, [hostId, loadProgress]);
+
+  const flushProgressSaves = useCallback(async () => {
+    if (progressSaveRunning.current) return;
+    progressSaveRunning.current = true;
+    try {
+      while (pendingProgressSaves.current.size > 0) {
+        const firstEntry = pendingProgressSaves.current.entries().next().value;
+        if (!firstEntry) break;
+        const [pendingKey, pending] = firstEntry;
+        pendingProgressSaves.current.delete(pendingKey);
+        try {
+          await saveReadProgress(client, pending.agentId, pending.cursor);
+          const current = progressContext.current;
+          if (current.hostId === pending.hostId && current.agentId === pending.agentId) {
+            setProgressError(null);
+          }
+        } catch (nextError) {
+          const current = progressContext.current;
+          if (current.hostId === pending.hostId && current.agentId === pending.agentId) {
+            setProgressError(nextError instanceof Error ? nextError.message : String(nextError));
+          }
+        }
+      }
+    } finally {
+      progressSaveRunning.current = false;
+    }
+  }, [client]);
+
+  const queueProgressSave = useCallback(
+    (cursor: ReadProgressCursor) => {
+      progressRequestToken.current += 1;
+      setSavedProgress(cursor);
+      setProgressStatus("ready");
+      setProgressError(null);
+      pendingProgressSaves.current.set(`${hostId}:${agentId}`, { hostId, agentId, cursor });
+      void flushProgressSaves();
+    },
+    [agentId, flushProgressSaves, hostId],
+  );
+
+  const retryProgress = useCallback(() => {
+    if (savedProgress) queueProgressSave(savedProgress);
+    else void loadProgress();
+  }, [loadProgress, queueProgressSave, savedProgress]);
+
   const scrollToSegment = useCallback((responseId: string, segmentIndex: number) => {
     const responseY = responseOffsets.current.get(responseId);
     const listY = listOffsets.current.get(responseId);
     const segmentY = segmentOffsets.current.get(`${responseId}:${segmentIndex}`);
     if (responseY === undefined || listY === undefined || segmentY === undefined) return;
     scrollRef.current?.scrollTo({
-      y: Math.max(0, responseY + listY + segmentY - 88),
+      y: Math.max(0, responseY + listY + segmentY - 16),
       animated: true,
     });
   }, []);
@@ -412,13 +505,12 @@ function ReadAloudPanelContent({
     playbackToken.current += 1;
     clearLoadingSegments();
     clearHighlightTimer();
-    const stoppedImmediately = stopActiveAudio();
+    const stoppedImmediately = stopActiveAudio(client);
     setPlayback({ status: "idle" });
-    toast.show(
-      stoppedImmediately ? "已停止朗读" : "已停止后续内容，当前音频分段结束后停止",
-      { variant: "info" },
-    );
-  }, [clearHighlightTimer, clearLoadingSegments, toast]);
+    toast.show(stoppedImmediately ? "已停止朗读" : "已停止后续内容，当前音频分段结束后停止", {
+      variant: "info",
+    });
+  }, [clearHighlightTimer, clearLoadingSegments, client, toast]);
 
   const startChunkHighlight = useCallback(
     (token: number, unit: ConversationSpeechUnit, durationMs: number) => {
@@ -427,17 +519,13 @@ function ReadAloudPanelContent({
         tokenizeSpeechText(part.text).map((speechToken, tokenIndex) => ({
           part,
           speechToken,
-          tokenIndex,
+          tokenIndex: (part.tokenOffset ?? 0) + tokenIndex,
         })),
       );
-      const totalWeight = weightedTokens.reduce(
-        (sum, item) => sum + item.speechToken.weight,
-        0,
-      );
+      const totalWeight = weightedTokens.reduce((sum, item) => sum + item.speechToken.weight, 0);
       let elapsedWeight = 0;
       const steps = weightedTokens.flatMap((item) => {
-        const atMs =
-          totalWeight > 0 ? Math.round((elapsedWeight / totalWeight) * durationMs) : 0;
+        const atMs = totalWeight > 0 ? Math.round((elapsedWeight / totalWeight) * durationMs) : 0;
         elapsedWeight += item.speechToken.weight;
         return item.speechToken.isWord ? [{ ...item, atMs }] : [];
       });
@@ -472,13 +560,31 @@ function ReadAloudPanelContent({
   );
 
   const speakFrom = useCallback(
-    async (responseIndex: number, segmentIndex: number) => {
+    async (
+      responseIndex: number,
+      segmentIndex: number,
+      options: { characterOffset?: number; replaceProgress?: boolean } = {},
+    ) => {
       const token = ++playbackToken.current;
       setPlaybackError(null);
       clearLoadingSegments();
       clearHighlightTimer();
-      stopActiveAudio();
-      const units = buildConversationSpeechUnits(responses, responseIndex, segmentIndex);
+      stopActiveAudio(client);
+      const start: SpeechStart = {
+        responseIndex,
+        segmentIndex,
+        characterOffset: options.characterOffset ?? 0,
+      };
+      if (options.replaceProgress) {
+        const cursor = cursorAtSpeechStart(responses, start);
+        if (cursor) queueProgressSave(cursor);
+      }
+      const units = buildConversationSpeechUnits(
+        responses,
+        start.responseIndex,
+        start.segmentIndex,
+        start.characterOffset,
+      );
       if (units.length === 0) return;
       let failedUnit: ConversationSpeechUnit | null = null;
 
@@ -500,11 +606,15 @@ function ReadAloudPanelContent({
           async prepare(unit) {
             updateLoadingSegment(token, unit, 1);
             try {
-              const audio = await client.rpc(synthesizeSpeechRpc, {
-                text: unit.text,
-                voice: voice || undefined,
-                speed,
-              });
+              const audio = await speechAudioCache.getOrLoad(
+                speechAudioCacheKey({ hostId, voice, speed, text: unit.text }),
+                () =>
+                  client.rpc(synthesizeSpeechRpc, {
+                    text: unit.text,
+                    voice: voice || undefined,
+                    speed,
+                  }),
+              );
               return { audio, playback: await prepareAudio(client, audio) };
             } catch (nextError) {
               failedUnit = unit;
@@ -514,6 +624,7 @@ function ReadAloudPanelContent({
             }
           },
           onPlaying: (prepared, unit) => {
+            failedUnit = unit;
             setPlayback({
               status: "speaking",
               responseId: unit.responseId,
@@ -524,9 +635,18 @@ function ReadAloudPanelContent({
             scrollToSegment(unit.responseId, unit.segmentIndex);
             startChunkHighlight(token, unit, prepared.audio.durationMs);
           },
-          async play(prepared) {
-            await prepared.playback.play();
+          async play(prepared, unit) {
+            try {
+              await prepared.playback.play();
+            } catch (nextError) {
+              failedUnit = unit;
+              throw nextError;
+            }
             clearHighlightTimer();
+            if (playbackToken.current === token) {
+              const cursor = cursorAfterSpeechUnit(responses, unit);
+              if (cursor) queueProgressSave(cursor);
+            }
           },
           dispose(prepared) {
             prepared.playback.dispose();
@@ -535,7 +655,7 @@ function ReadAloudPanelContent({
         if (playbackToken.current === token) {
           clearLoadingSegments();
           setPlayback({ status: "idle" });
-          toast.show("已从上到下朗读完成", { variant: "success" });
+          toast.show("已朗读到当前最新回复", { variant: "success" });
         }
       } catch (nextError) {
         if (playbackToken.current !== token) return;
@@ -548,6 +668,7 @@ function ReadAloudPanelContent({
           message,
           responseIndex: retryUnit.responseIndex,
           segmentIndex: retryUnit.segmentIndex,
+          characterOffset: retryUnit.parts[0]?.characterOffset ?? 0,
         });
         toast.error(message);
       }
@@ -556,6 +677,8 @@ function ReadAloudPanelContent({
       clearHighlightTimer,
       clearLoadingSegments,
       client,
+      hostId,
+      queueProgressSave,
       responses,
       scrollToSegment,
       speed,
@@ -567,51 +690,84 @@ function ReadAloudPanelContent({
   );
 
   const isActive = playback.status !== "idle";
+  const resumeStart = useMemo(
+    () => (progressStatus === "ready" ? resolveSpeechStart(responses, savedProgress) : null),
+    [progressStatus, responses, savedProgress],
+  );
+  const hasUnreadContent = useMemo(() => {
+    if (!resumeStart) return false;
+    return (
+      buildConversationSpeechUnits(
+        responses,
+        resumeStart.responseIndex,
+        resumeStart.segmentIndex,
+        resumeStart.characterOffset,
+      ).length > 0
+    );
+  }, [responses, resumeStart]);
+  const resumeLabel = getResumeLabel(progressStatus, savedProgress !== null, hasUnreadContent);
 
   if (loading) return <Loading />;
 
   return (
     <View style={styles.root}>
-      <ScrollView ref={scrollRef} contentContainerStyle={styles.content}>
-        <View style={styles.header}>
-          <View style={styles.titleGroup}>
-            <Text style={styles.title}>连续朗读</Text>
-            <Text style={styles.hint}>
-              首段快速生成，播放时自动准备下一大段；自动清理 Markdown、链接、代码和装饰字符，点击任意句子可从那里继续。
-            </Text>
-          </View>
-          <View style={styles.headerActions}>
+      <View style={styles.header}>
+        <View style={styles.titleGroup}>
+          <Text style={styles.title}>连续朗读</Text>
+          <Text style={styles.hint}>
+            自动记住每个对话上次读到的位置；默认继续未读回复，并持续预加载后续 5
+            段。点击任意句子可指定新的起点。
+          </Text>
+        </View>
+        <View style={styles.headerActions}>
+          <ActionButton
+            label={refreshing ? "刷新中" : "刷新"}
+            icon="RefreshCw"
+            disabled={isActive || refreshing}
+            onPress={retryLoadResponses}
+            styles={styles}
+            theme={theme}
+          />
+          {isActive ? (
             <ActionButton
-              label={refreshing ? "刷新中" : "刷新"}
-              icon="RefreshCw"
-              disabled={isActive || refreshing}
-              onPress={retryLoadResponses}
+              label="停止"
+              icon="Square"
+              active
+              onPress={stop}
               styles={styles}
               theme={theme}
             />
-            {isActive ? (
+          ) : (
+            <>
+              {responses.length > 0 && (savedProgress || progressStatus === "error") ? (
+                <ActionButton
+                  label="从顶部重读"
+                  icon="RotateCcw"
+                  onPress={() => void speakFrom(0, 0, { replaceProgress: true })}
+                  styles={styles}
+                  theme={theme}
+                />
+              ) : null}
               <ActionButton
-                label="停止"
-                icon="Square"
-                active
-                onPress={stop}
-                styles={styles}
-                theme={theme}
-              />
-            ) : (
-              <ActionButton
-                label="从顶部开始"
+                label={resumeLabel}
                 icon="Play"
                 active
-                disabled={responses.length === 0}
-                onPress={() => void speakFrom(0, 0)}
+                disabled={responses.length === 0 || progressStatus !== "ready" || !hasUnreadContent}
+                onPress={() => {
+                  if (!resumeStart) return;
+                  void speakFrom(resumeStart.responseIndex, resumeStart.segmentIndex, {
+                    characterOffset: resumeStart.characterOffset,
+                  });
+                }}
                 styles={styles}
                 theme={theme}
               />
-            )}
-          </View>
+            </>
+          )}
         </View>
+      </View>
 
+      <ScrollView ref={scrollRef} style={styles.scroll} contentContainerStyle={styles.content}>
         <View style={styles.controls} accessibilityLabel="朗读设置">
           <ChoiceRow<string>
             label="声音"
@@ -630,6 +786,24 @@ function ReadAloudPanelContent({
             styles={styles}
           />
         </View>
+
+        {progressError ? (
+          <View style={styles.errorPanel} accessibilityRole="alert">
+            <Text selectable style={styles.errorText}>
+              朗读位置同步失败：{progressError}
+              {progressStatus === "error"
+                ? "\n请重试同步，或明确选择从顶部重读。"
+                : "\n当前页面内的位置仍然保留，请重试同步。"}
+            </Text>
+            <ActionButton
+              label="重试同步"
+              icon="RefreshCw"
+              onPress={retryProgress}
+              styles={styles}
+              theme={theme}
+            />
+          </View>
+        ) : null}
 
         {error ? (
           <View style={styles.errorPanel} accessibilityRole="alert">
@@ -662,7 +836,9 @@ function ReadAloudPanelContent({
               icon="Play"
               disabled={isActive}
               onPress={() =>
-                void speakFrom(playbackError.responseIndex, playbackError.segmentIndex)
+                void speakFrom(playbackError.responseIndex, playbackError.segmentIndex, {
+                  characterOffset: playbackError.characterOffset,
+                })
               }
               styles={styles}
               theme={theme}
@@ -673,7 +849,8 @@ function ReadAloudPanelContent({
           <Text style={styles.empty}>当前会话还没有可朗读的助手回复。</Text>
         ) : (
           responses.map((response, responseIndex) => {
-            const responseActive = playback.status !== "idle" && playback.responseId === response.id;
+            const responseActive =
+              playback.status !== "idle" && playback.responseId === response.id;
             return (
               <View
                 key={response.id}
@@ -695,9 +872,7 @@ function ReadAloudPanelContent({
                   {response.segments.map((segment, segmentIndex) => {
                     const segmentActive = responseActive && playback.segmentIndex === segmentIndex;
                     const segmentSpeaking = segmentActive && playback.status === "speaking";
-                    const segmentLoading = loadingSegments.has(
-                      `${response.id}:${segmentIndex}`,
-                    );
+                    const segmentLoading = loadingSegments.has(`${response.id}:${segmentIndex}`);
                     const tokens = tokenizeSpeechText(segment.text);
                     return (
                       <Pressable
@@ -708,8 +883,8 @@ function ReadAloudPanelContent({
                           segmentLoading
                             ? `正在加载第 ${segmentIndex + 1} 句：${segment.text}`
                             : segmentActive
-                            ? `${segmentSpeaking ? "正在朗读" : "正在准备"}第 ${segmentIndex + 1} 句：${segment.text}`
-                            : `从第 ${segmentIndex + 1} 句开始连续朗读`
+                              ? `${segmentSpeaking ? "正在朗读" : "正在准备"}第 ${segmentIndex + 1} 句：${segment.text}`
+                              : `从第 ${segmentIndex + 1} 句开始连续朗读`
                         }
                         accessibilityHint="将继续朗读这句话之后的全部回复"
                         accessibilityState={{ selected: segmentActive, busy: segmentLoading }}
@@ -719,7 +894,9 @@ function ReadAloudPanelContent({
                             event.nativeEvent.layout.y,
                           );
                         }}
-                        onPress={() => void speakFrom(responseIndex, segmentIndex)}
+                        onPress={() =>
+                          void speakFrom(responseIndex, segmentIndex, { replaceProgress: true })
+                        }
                         style={[
                           styles.segment,
                           segmentActive && styles.segmentActive,
@@ -736,10 +913,7 @@ function ReadAloudPanelContent({
                         </Text>
                         <Text
                           selectable
-                          style={[
-                            styles.segmentText,
-                            segmentActive && styles.segmentTextActive,
-                          ]}
+                          style={[styles.segmentText, segmentActive && styles.segmentTextActive]}
                         >
                           {tokens.map((token, tokenIndex) => (
                             <Text
@@ -766,9 +940,7 @@ function ReadAloudPanelContent({
                             name={segmentActive ? "AudioLines" : "Play"}
                             size={16}
                             color={
-                              segmentActive
-                                ? theme.colors.accent
-                                : theme.colors.foregroundMuted
+                              segmentActive ? theme.colors.accent : theme.colors.foregroundMuted
                             }
                           />
                         )}
@@ -783,6 +955,17 @@ function ReadAloudPanelContent({
       </ScrollView>
     </View>
   );
+}
+
+function getResumeLabel(
+  status: ProgressStatus,
+  hasSavedProgress: boolean,
+  hasUnreadContent: boolean,
+) {
+  if (status === "loading") return "读取位置中";
+  if (status === "error") return "位置不可用";
+  if (!hasSavedProgress) return "从顶部开始";
+  return hasUnreadContent ? "继续朗读" : "没有新内容";
 }
 
 function ChoiceRow<Value extends string | number>({
@@ -855,11 +1038,7 @@ function ActionButton({
       accessibilityState={{ disabled }}
       disabled={disabled}
       onPress={onPress}
-      style={[
-        styles.button,
-        active && styles.buttonActive,
-        disabled && styles.buttonDisabled,
-      ]}
+      style={[styles.button, active && styles.buttonActive, disabled && styles.buttonDisabled]}
     >
       <Icon
         name={icon}

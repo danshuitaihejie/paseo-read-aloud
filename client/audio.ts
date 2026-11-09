@@ -6,8 +6,12 @@ export interface PreparedAudio {
   dispose(): void;
 }
 
-export function stopActiveAudio() {
-  return stopActiveWebAudio();
+export function stopActiveAudio(client?: PluginClientContext) {
+  const stoppedWebAudio = stopActiveWebAudio();
+  const stoppableClient = client as (PluginClientContext & { stopAudio?: () => void }) | undefined;
+  const canStopHostAudio = typeof stoppableClient?.stopAudio === "function";
+  stoppableClient?.stopAudio?.();
+  return stoppedWebAudio || canStopHostAudio;
 }
 
 export async function prepareAudio(

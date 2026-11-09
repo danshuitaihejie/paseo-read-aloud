@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 vi.mock("react-native", () => ({ Platform: { OS: "web" } }));
 
 import { prepareWebAudio, stopActiveWebAudio } from "../client/web";
+import { stopActiveAudio } from "../client/audio";
 
 interface TestAudioInstance {
   src: string;
@@ -24,6 +25,14 @@ afterEach(() => {
 });
 
 describe("web audio preloading", () => {
+  it("also asks the host to stop plugin-owned native audio", () => {
+    const stopAudio = vi.fn();
+    const stopped = stopActiveAudio({ stopAudio } as never);
+
+    expect(stopped).toBe(true);
+    expect(stopAudio).toHaveBeenCalledOnce();
+  });
+
   it("loads the complete next audio source without starting playback", async () => {
     let audio: TestAudioInstance | undefined;
     class TestAudio implements TestAudioInstance {
