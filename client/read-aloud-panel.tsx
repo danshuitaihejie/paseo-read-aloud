@@ -34,7 +34,7 @@ interface AssistantResponse {
 }
 
 type PlaybackState =
-  | { status: "idle" }
+  | { status: "idle" | "waiting" }
   | {
       status: "preparing" | "speaking";
       responseId: string;
@@ -95,6 +95,7 @@ export function createReadAloudScreen(client: PluginClientContext) {
     }
     return (
       <ReadAloudPanelContent
+        key={`${host.id}:${agentId}`}
         agentId={agentId}
         client={client}
         hostId={host.id}
@@ -585,7 +586,10 @@ function ReadAloudPanelContent({
         start.segmentIndex,
         start.characterOffset,
       );
-      if (units.length === 0) return;
+      if (units.length === 0) {
+        setPlayback({ status: "waiting" });
+        return;
+      }
       let failedUnit: ConversationSpeechUnit | null = null;
 
       try {
@@ -654,8 +658,7 @@ function ReadAloudPanelContent({
         });
         if (playbackToken.current === token) {
           clearLoadingSegments();
-          setPlayback({ status: "idle" });
-          toast.show("已朗读到当前最新回复", { variant: "success" });
+          setPlayback({ status: "waiting" });
         }
       } catch (nextError) {
         if (playbackToken.current !== token) return;
@@ -707,6 +710,13 @@ function ReadAloudPanelContent({
   }, [responses, resumeStart]);
   const resumeLabel = getResumeLabel(progressStatus, savedProgress !== null, hasUnreadContent);
 
+  useEffect(() => {
+    if (playback.status !== "waiting" || !hasUnreadContent || !resumeStart) return;
+    void speakFrom(resumeStart.responseIndex, resumeStart.segmentIndex, {
+      characterOffset: resumeStart.characterOffset,
+    });
+  }, [hasUnreadContent, playback.status, resumeStart, speakFrom]);
+
   if (loading) return <Loading />;
 
   return (
@@ -716,14 +726,23 @@ function ReadAloudPanelContent({
           <Text style={styles.title}>连续朗读</Text>
           <Text style={styles.hint}>
             自动记住每个对话上次读到的位置；默认继续未读回复，并持续预加载后续 5
-            段。点击任意句子可指定新的起点。
+            段。读完后等待新内容并自动续读，点击任意句子可指定新的起点。
           </Text>
+          {playback.status === "waiting" ? (
+            <Text
+              style={styles.hint}
+              accessibilityLabel="等待新内容"
+              accessibilityLiveRegion="polite"
+            >
+              已读完当前内容，等待新内容后自动继续。
+            </Text>
+          ) : null}
         </View>
         <View style={styles.headerActions}>
           <ActionButton
             label={refreshing ? "刷新中" : "刷新"}
             icon="RefreshCw"
-            disabled={isActive || refreshing}
+            disabled={refreshing}
             onPress={retryLoadResponses}
             styles={styles}
             theme={theme}
@@ -850,7 +869,8 @@ function ReadAloudPanelContent({
         ) : (
           responses.map((response, responseIndex) => {
             const responseActive =
-              playback.status !== "idle" && playback.responseId === response.id;
+              (playback.status === "preparing" || playback.status === "speaking") &&
+              playback.responseId === response.id;
             return (
               <View
                 key={response.id}
