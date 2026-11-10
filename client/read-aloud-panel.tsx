@@ -3,7 +3,7 @@ import { getPaseoClient, useHosts } from "@getpaseo/plugin/client";
 import { Icon, Loading, ScrollView, useToast } from "@getpaseo/plugin/client/ui";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { LayoutChangeEvent, ScrollView as NativeScrollView } from "react-native";
-import { ActivityIndicator, KeyboardAvoidingView, Pressable, Text, View } from "react-native";
+import { ActivityIndicator, Pressable, Text, View } from "react-native";
 import {
   cursorAfterSpeechUnit,
   cursorAtSpeechStart,
@@ -22,6 +22,7 @@ import {
 } from "../shared/text";
 import { prepareAudio, stopActiveAudio } from "./audio";
 import { isTransientConnectionError } from "./connection-errors";
+import { KeyboardAvoidingPage } from "./keyboard-avoiding-page";
 import { MessageComposer } from "./message-composer";
 import { runPrefetchedPlayback } from "./prefetched-playback";
 import { loadReadProgress, saveReadProgress } from "./read-progress-store";
@@ -721,10 +722,7 @@ function ReadAloudPanelContent({
   if (loading) return <Loading />;
 
   return (
-    <KeyboardAvoidingView
-      style={styles.root}
-      behavior={layout.platform === "ios" ? "padding" : undefined}
-    >
+    <KeyboardAvoidingPage style={styles.root} platform={layout.platform}>
       <View style={styles.header}>
         <View style={styles.titleGroup}>
           <Text style={styles.title}>连续朗读</Text>
@@ -984,7 +982,7 @@ function ReadAloudPanelContent({
         theme={theme}
         layout={layout}
       />
-    </KeyboardAvoidingView>
+    </KeyboardAvoidingPage>
   );
 }
 
