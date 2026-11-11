@@ -1,11 +1,17 @@
 {
   "id": "paseo-read-aloud",
   "name": "专属朗读",
-  "description": "在当前正式版 Paseo 中浏览助手回复，并从任意句子开始朗读。",
+  "description": "连续朗读 AI 回复，边听边聊；手动滚动自由翻看，一键恢复跟随。",
+  "media": [
+    "docs/media/read-aloud-desktop.png",
+    "docs/media/read-aloud-browse.png",
+    "docs/media/read-aloud-mobile.png",
+    "docs/media/read-aloud-demo.mp4"
+  ],
   "translations": {
     "zh-CN": {
       "name": "专属朗读",
-      "description": "在当前正式版 Paseo 中浏览助手回复，并从任意句子开始朗读。"
+      "description": "连续朗读 AI 回复，边听边聊；手动滚动自由翻看，一键恢复跟随。"
     }
   },
   "requirements": {

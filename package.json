@@ -2,7 +2,7 @@
   "name": "paseo-read-aloud",
   "version": "0.1.0",
   "private": true,
-  "description": "Read any Paseo assistant response aloud from a chosen sentence.",
+  "description": "Listen to AI replies, ask follow-ups, and browse freely with one-click return to the current sentence.",
   "license": "MIT",
   "author": "feng先生",
   "repository": {
@@ -19,7 +19,8 @@
     "index.server.tsx",
     "client/",
     "server/",
-    "shared/"
+    "shared/",
+    "docs/media/"
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",

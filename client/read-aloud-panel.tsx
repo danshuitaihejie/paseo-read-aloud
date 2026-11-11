@@ -27,6 +27,7 @@ import { MessageComposer } from "./message-composer";
 import { runPrefetchedPlayback } from "./prefetched-playback";
 import { loadReadProgress, saveReadProgress } from "./read-progress-store";
 import { speechAudioCache, speechAudioCacheKey } from "./speech-cache";
+import { observeWebScrollIntent, stopWebScrollAnimation } from "./web";
 
 interface AssistantResponse {
   id: string;
@@ -134,6 +135,8 @@ function ReadAloudPanelContent({
   const [progressError, setProgressError] = useState<string | null>(null);
   const [voice, setVoice] = useState<string>("female-shaonv");
   const [speed, setSpeed] = useState(1);
+  const [following, setFollowing] = useState(true);
+  const followingRef = useRef(true);
   const playbackToken = useRef(0);
   const loadRequestToken = useRef(0);
   const loadResponsesRef = useRef<() => Promise<void>>(async () => {});
@@ -145,6 +148,7 @@ function ReadAloudPanelContent({
   const previousHost = useRef({ id: hostId, status: hostStatus });
   const hostStatusRef = useRef(hostStatus);
   const scrollRef = useRef<NativeScrollView>(null);
+  const scrollIntentCleanup = useRef<(() => void) | null>(null);
   const responseOffsets = useRef(new Map<string, number>());
   const listOffsets = useRef(new Map<string, number>());
   const segmentOffsets = useRef(new Map<string, number>());
@@ -493,7 +497,25 @@ function ReadAloudPanelContent({
     else void loadProgress();
   }, [loadProgress, queueProgressSave, savedProgress]);
 
+  const pauseFollowing = useCallback(() => {
+    if (!followingRef.current) return;
+    followingRef.current = false;
+    setFollowing(false);
+    stopWebScrollAnimation(scrollRef.current);
+  }, []);
+
+  const attachScrollView = useCallback(
+    (view: NativeScrollView | null) => {
+      scrollIntentCleanup.current?.();
+      scrollRef.current = view;
+      scrollIntentCleanup.current = observeWebScrollIntent(view, pauseFollowing);
+    },
+    [pauseFollowing],
+  );
+
   const scrollToSegment = useCallback((responseId: string, segmentIndex: number) => {
+    // Playback callbacks outlive renders; user input must block even an already queued callback.
+    if (!followingRef.current) return;
     const responseY = responseOffsets.current.get(responseId);
     const listY = listOffsets.current.get(responseId);
     const segmentY = segmentOffsets.current.get(`${responseId}:${segmentIndex}`);
@@ -503,6 +525,14 @@ function ReadAloudPanelContent({
       animated: true,
     });
   }, []);
+
+  const resumeFollowing = useCallback(() => {
+    followingRef.current = true;
+    setFollowing(true);
+    if (playback.status === "preparing" || playback.status === "speaking") {
+      scrollToSegment(playback.responseId, playback.segmentIndex);
+    }
+  }, [playback, scrollToSegment]);
 
   const stop = useCallback(() => {
     playbackToken.current += 1;
@@ -741,6 +771,14 @@ function ReadAloudPanelContent({
           ) : null}
         </View>
         <View style={styles.headerActions}>
+          <ScrollFollowButton
+            visible={responses.length > 0}
+            following={following}
+            onPause={pauseFollowing}
+            onResume={resumeFollowing}
+            styles={styles}
+            theme={theme}
+          />
           <ActionButton
             label={refreshing ? "刷新中" : "刷新"}
             icon="RefreshCw"
@@ -788,7 +826,12 @@ function ReadAloudPanelContent({
         </View>
       </View>
 
-      <ScrollView ref={scrollRef} style={styles.scroll} contentContainerStyle={styles.content}>
+      <ScrollView
+        ref={attachScrollView}
+        onScrollBeginDrag={pauseFollowing}
+        style={styles.scroll}
+        contentContainerStyle={styles.content}
+      >
         <View style={styles.controls} accessibilityLabel="朗读设置">
           <ChoiceRow<string>
             label="声音"
@@ -1040,6 +1083,34 @@ function ChoiceRow<Value extends string | number>({
         })}
       </View>
     </View>
+  );
+}
+
+function ScrollFollowButton({
+  visible,
+  following,
+  onPause,
+  onResume,
+  styles,
+  theme,
+}: {
+  visible: boolean;
+  following: boolean;
+  onPause(): void;
+  onResume(): void;
+  styles: Record<string, object>;
+  theme: PluginScreenProps["theme"];
+}) {
+  if (!visible) return null;
+  return (
+    <ActionButton
+      label={following ? "暂停跟随" : "恢复跟随"}
+      icon="LocateFixed"
+      active={following}
+      onPress={following ? onPause : onResume}
+      styles={styles}
+      theme={theme}
+    />
   );
 }
 

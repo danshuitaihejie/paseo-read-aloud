@@ -22,9 +22,11 @@ const host = vi.hoisted(() => ({
   status: "online",
   statusListeners: new Set<() => void>(),
   send: vi.fn<(hostId: string, agentId: string, text: string) => Promise<void>>(),
+  scrollTo: vi.fn(),
 }));
 
 vi.mock("react-native", () => ({
+  Platform: { OS: "ios" },
   ActivityIndicator: "ActivityIndicator",
   KeyboardAvoidingView: "KeyboardAvoidingView",
   Pressable: "Pressable",
@@ -123,6 +125,10 @@ async function renderPanel() {
     const queryClient = new QueryClient({ defaultOptions: { mutations: { gcTime: Infinity } } });
     renderer = create(
       createElement(QueryClientProvider, { client: queryClient }, createElement(Screen, props)),
+      {
+        createNodeMock: (element) =>
+          element.type === "ScrollView" ? { scrollTo: host.scrollTo } : null,
+      },
     );
   });
 }
@@ -149,6 +155,99 @@ async function enterMessage(text: string) {
       .props.onChangeText(text);
   });
 }
+
+async function layoutResponses() {
+  await act(async () => {
+    for (const node of renderer.root.findAll(
+      (item) => typeof item.type === "string" && item.props.onLayout,
+    )) {
+      node.props.onLayout({ nativeEvent: { layout: { y: 100 } } });
+    }
+  });
+}
+
+function beginScrollDrag() {
+  renderer.root
+    .find((node) => typeof node.props.onScrollBeginDrag === "function")
+    .props.onScrollBeginDrag();
+}
+
+describe("read-aloud scroll following", () => {
+  it("keeps highlighting across sentences without scrolling until following is explicitly resumed", async () => {
+    host.entries[0].item.text = "先读第一句。再读第二句。";
+    await renderPanel();
+    await layoutResponses();
+    await press("从顶部开始");
+    expect(host.scrollTo).toHaveBeenCalledWith({ y: 284, animated: true });
+
+    await act(async () => {
+      beginScrollDrag();
+    });
+    const scrollCount = host.scrollTo.mock.calls.length;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(800);
+    });
+    expect(
+      renderer.root.findByProps({ testID: "read-aloud-segment-0-1" }).props.accessibilityState
+        .selected,
+    ).toBe(true);
+    expect(renderer.root.findAllByProps({ testID: "read-aloud-active-word" })).not.toHaveLength(0);
+    expect(host.scrollTo).toHaveBeenCalledTimes(scrollCount);
+
+    // A long pause, audio completion, and a newly arrived response must not re-enable following.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+    await act(async () => finishAudio());
+    host.entries.push({
+      item: { type: "assistant_message", messageId: "second", text: "继续读新回复。" },
+      timestamp: new Date(2_000).toISOString(),
+      seqStart: 2,
+      seqEnd: 2,
+    });
+    await refresh();
+    await layoutResponses();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(200);
+    });
+    expect(spoken).toEqual(["先读第一句。 再读第二句。", "继续读新回复。"]);
+    expect(host.scrollTo).toHaveBeenCalledTimes(scrollCount);
+
+    await press("恢复跟随");
+    expect(host.scrollTo).toHaveBeenCalledTimes(scrollCount + 1);
+    expect(renderer.root.findAllByProps({ accessibilityLabel: "暂停跟随" })).toHaveLength(1);
+  });
+
+  it("blocks an audio preparation callback that finishes after the user starts scrolling", async () => {
+    let releasePreparation: () => void = () => {};
+    vi.mocked(prepareAudio).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          releasePreparation = () =>
+            resolve({
+              play: () =>
+                new Promise<void>((finish) => {
+                  finishAudio = finish;
+                }),
+              dispose() {},
+            });
+        }),
+    );
+    await renderPanel();
+    await layoutResponses();
+    await press("从顶部开始");
+    const scrollCount = host.scrollTo.mock.calls.length;
+    await act(async () => {
+      beginScrollDrag();
+      releasePreparation();
+      await vi.advanceTimersByTimeAsync(100);
+    });
+    expect(host.scrollTo).toHaveBeenCalledTimes(scrollCount);
+    expect(renderer.root.findAllByProps({ testID: "read-aloud-active-word" })).not.toHaveLength(0);
+    await press("恢复跟随");
+    expect(host.scrollTo).toHaveBeenCalledTimes(scrollCount + 1);
+  });
+});
 
 describe("continuous read-aloud", () => {
   it("waits at the end and automatically reads only the newly arrived reply", async () => {

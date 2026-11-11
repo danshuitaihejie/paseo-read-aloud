@@ -2,23 +2,24 @@
 
 [简体中文](README.md) | **English**
 
-Listen and keep the conversation going in Paseo. Read assistant responses continuously, start from any sentence, ask follow-up questions on the same page, and hear new content as it arrives.
+Keep listening while you read ahead, ask a follow-up, or wait for the next reply. Paseo Read Aloud reads assistant responses continuously, highlights the spoken words, and remembers where you left off in each conversation.
 
-![Read Aloud in action: word highlighting, a follow-up question, and automatic continuation](docs/media/read-aloud-demo.gif)
+![Read Aloud in action: word highlighting, free browsing, resuming following, and a follow-up reply read automatically](docs/media/read-aloud-demo.gif)
 
 Recorded from the plugin UI with a sample conversation. Both the GIF and video are silent. [Download the MP4 demo](docs/media/read-aloud-demo.mp4).
 
 ## Features
 
-| Feature                | How it works                                                                                                   |
-| ---------------------- | -------------------------------------------------------------------------------------------------------------- |
-| Continuous reading     | Start at the top or at any sentence and keep listening through later responses.                                |
-| Automatic continuation | Wait at the end of the current content, then resume from the saved position when a reply or more text arrives. |
-| Follow-up chat         | A text field and Send button use the same agent, model, and configuration.                                     |
-| Saved progress         | Each conversation remembers your reading progress so you can continue with unread content.                     |
-| Reading guidance       | Approximate word highlighting and scrolling follow the active sentence.                                        |
-| Audio preparation      | A rolling buffer preloads the next 5 chunks, shows loading states, and caches synthesized audio.               |
-| Voices and speed       | Choose from 4 MiniMax female voice presets and playback speeds of 0.8×, 1×, 1.2×, or 1.5×.                     |
+| Feature                 | What you can do                                                                                                                                           |
+| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Continuous reading      | Start at the top or any sentence, then listen through later responses.                                                                                    |
+| Automatic continuation  | At the end, wait for a reply or more text and continue reading from the saved position.                                                                   |
+| Browse while listening  | Scroll through the conversation at your own pace. Reading and word highlighting continue while automatic following is paused.                             |
+| Follow the current line | Select **恢复跟随** (“Resume following”) to jump back to the sentence being read and follow it again. Following stays paused until you select the button. |
+| Follow-up chat          | Send a question to the same agent, model, and configuration without leaving the reading page.                                                             |
+| Saved progress          | Keep a separate reading position for each conversation and continue with unread content.                                                                  |
+| Audio preparation       | Preload the next 5 chunks in a rolling buffer, show loading states, and cache synthesized audio.                                                          |
+| Voices and speed        | Choose from 4 MiniMax female voice presets and playback speeds of 0.8×, 1×, 1.2×, or 1.5×.                                                                |
 
 Before synthesis, the plugin removes Markdown decoration, raw URLs, code blocks, generic attachment labels, and symbol-only paragraphs. It preserves readable headings, lists, tables, and link labels.
 
@@ -27,6 +28,10 @@ Before synthesis, the plugin removes Markdown decoration, raw URLs, code blocks,
 Desktop: responses, reading controls, and a follow-up input on one page.
 
 ![Desktop reading page with an active word highlighted and a follow-up input at the bottom](docs/media/read-aloud-desktop.png)
+
+Browse while listening: manual scrolling keeps the active word highlighted without pulling the page back. Select **恢复跟随** to return to the current sentence.
+
+![Free browsing during playback with the Resume following button visible](docs/media/read-aloud-browse.png)
 
 <details>
 <summary>See the compact layout and dark theme</summary>
@@ -51,12 +56,19 @@ Open an agent conversation and select **朗读** beside its composer, or choose 
 
 The built-in female voice presets use MiniMax voice IDs. For another OpenAI-compatible service, choose **Paseo 默认** to use the voice from Paseo's settings.
 
+For an existing GitHub installation, update to the latest features with:
+
+```bash
+paseo plugin update paseo-read-aloud
+```
+
 ## Use
 
 1. Select **从顶部开始** to start at the top, **继续朗读** to resume, or select any sentence.
 2. Type a question at the bottom and press Send while reading continues. Enter inserts a new line. Accepted messages clear the input; failed messages stay available for retry.
 3. Keep the page open at the end of the content. New responses resume playback automatically.
-4. Select **停止** to stop reading and automatic continuation.
+4. Scroll to browse other content. Select **恢复跟随** to return to the current sentence, or **暂停跟随** to pause following explicitly. New replies do not re-enable following after you have paused it.
+5. Select **停止** to stop reading and automatic continuation.
 
 ## TTS and data
 
