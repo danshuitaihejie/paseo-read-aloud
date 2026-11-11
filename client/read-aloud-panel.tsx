@@ -724,6 +724,14 @@ function ReadAloudPanelContent({
     ],
   );
 
+  const speakLatestResponse = useCallback(() => {
+    const latestIndex = responses.length - 1;
+    if (latestIndex < 0) return;
+    followingRef.current = true;
+    setFollowing(true);
+    void speakFrom(latestIndex, 0, { replaceProgress: true });
+  }, [responses.length, speakFrom]);
+
   const isActive = playback.status !== "idle";
   const resumeStart = useMemo(
     () => (progressStatus === "ready" ? resolveSpeechStart(responses, savedProgress) : null),
@@ -771,6 +779,14 @@ function ReadAloudPanelContent({
           ) : null}
         </View>
         <View style={styles.headerActions}>
+          <ActionButton
+            label="朗读最新回复"
+            icon="SkipForward"
+            disabled={responses.length === 0}
+            onPress={speakLatestResponse}
+            styles={styles}
+            theme={theme}
+          />
           <ScrollFollowButton
             visible={responses.length > 0}
             following={following}

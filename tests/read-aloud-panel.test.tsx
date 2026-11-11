@@ -249,6 +249,131 @@ describe("read-aloud scroll following", () => {
   });
 });
 
+function controlledPlayback(finishes: Array<() => void>) {
+  return {
+    play: () => new Promise<void>((resolve) => finishes.push(resolve)),
+    dispose() {},
+  };
+}
+
+describe("read latest response", () => {
+  it("starts at the first sentence of the latest reply and skips older responses", async () => {
+    host.entries = [
+      {
+        item: { type: "assistant_message", messageId: "older-1", text: "较早的回复内容。" },
+        timestamp: new Date(1_000).toISOString(),
+        seqStart: 1,
+        seqEnd: 1,
+      },
+      {
+        item: { type: "assistant_message", messageId: "older-2", text: "中间的回复内容。" },
+        timestamp: new Date(2_000).toISOString(),
+        seqStart: 2,
+        seqEnd: 2,
+      },
+      {
+        item: {
+          type: "assistant_message",
+          messageId: "latest",
+          text: "最新回复第一句。最新回复第二句。",
+        },
+        timestamp: new Date(3_000).toISOString(),
+        seqStart: 3,
+        seqEnd: 3,
+      },
+    ];
+    await renderPanel();
+    await layoutResponses();
+
+    await press("朗读最新回复");
+
+    expect(spoken).toEqual(["最新回复第一句。 最新回复第二句。"]);
+    expect(
+      renderer.root.findByProps({ testID: "read-aloud-segment-2-0" }).props.accessibilityState
+        .selected,
+    ).toBe(true);
+  });
+
+  it("restores following and jumps to the latest reply when following was paused", async () => {
+    host.entries.push({
+      item: { type: "assistant_message", messageId: "latest", text: "现在读最新回复。" },
+      timestamp: new Date(2_000).toISOString(),
+      seqStart: 2,
+      seqEnd: 2,
+    });
+    await renderPanel();
+    await layoutResponses();
+    await act(async () => beginScrollDrag());
+    const scrollCount = host.scrollTo.mock.calls.length;
+
+    await press("朗读最新回复");
+
+    expect(spoken).toEqual(["现在读最新回复。"]);
+    expect(host.scrollTo.mock.calls.length).toBeGreaterThan(scrollCount);
+    expect(renderer.root.findAllByProps({ accessibilityLabel: "暂停跟随" })).toHaveLength(1);
+  });
+
+  it("keeps the latest target when the previous playback completes after switching", async () => {
+    const finishes: Array<() => void> = [];
+    vi.mocked(prepareAudio).mockResolvedValue(controlledPlayback(finishes));
+    host.entries.push({
+      item: { type: "assistant_message", messageId: "latest", text: "切换后的最新回复。" },
+      timestamp: new Date(2_000).toISOString(),
+      seqStart: 2,
+      seqEnd: 2,
+    });
+    await renderPanel();
+    await layoutResponses();
+    await press("从顶部开始");
+    expect(finishes).toHaveLength(1);
+
+    await press("朗读最新回复");
+    expect(finishes).toHaveLength(2);
+    expect(
+      renderer.root.findByProps({ testID: "read-aloud-segment-1-0" }).props.accessibilityState
+        .selected,
+    ).toBe(true);
+
+    await act(async () => finishes[0]());
+    expect(
+      renderer.root.findByProps({ testID: "read-aloud-segment-1-0" }).props.accessibilityState
+        .selected,
+    ).toBe(true);
+    expect(renderer.root.findAllByProps({ accessibilityLabel: "停止" })).toHaveLength(1);
+  });
+
+  it("targets a reply that arrived in a timeline refresh", async () => {
+    await renderPanel();
+    host.entries.push({
+      item: { type: "assistant_message", messageId: "arrived", text: "刚到的新回复。" },
+      timestamp: new Date(2_000).toISOString(),
+      seqStart: 2,
+      seqEnd: 2,
+    });
+    await refresh();
+
+    await press("朗读最新回复");
+
+    expect(spoken).toEqual(["刚到的新回复。"]);
+    expect(
+      renderer.root.findByProps({ testID: "read-aloud-segment-1-0" }).props.accessibilityState
+        .selected,
+    ).toBe(true);
+  });
+
+  it("disables the action when there are no readable responses", async () => {
+    host.entries = [];
+    await renderPanel();
+
+    const latestButton = renderer.root.findByProps({
+      accessibilityLabel: "朗读最新回复",
+      accessibilityRole: "button",
+    });
+    expect(latestButton.props.disabled).toBe(true);
+    expect(latestButton.props.accessibilityState.disabled).toBe(true);
+  });
+});
+
 describe("continuous read-aloud", () => {
   it("waits at the end and automatically reads only the newly arrived reply", async () => {
     await renderPanel();
